@@ -1,0 +1,1964 @@
+
+---
+title: "Predicting Citation Impact of Biomedical Research"
+author: "Ria Goel"
+date: "`r Sys.Date()`"
+subtitle: "Dataset pubmed major B 1990-1991 Predicting Innovation Impact"
+header-includes:
+  - \usepackage{float}
+  - \usepackage{placeins}
+  - \floatplacement{figure}{H}
+  - \floatplacement{table}{H}
+  - \usepackage{titlesec}
+  - \usepackage{xcolor}
+  - \definecolor{darkblue}{RGB}{28, 54, 84}
+  - \titleformat{\section}{\large\bfseries\color{darkblue}}{\thesection}{1em}{}
+  - \titleformat{\subsection}{\normalsize\bfseries\color{darkblue}}{\thesubsection}{1em}{}
+  - \titleformat{\subsubsection}{\normalsize\color{darkblue}}{\thesubsubsection}{1em}{}
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    number_sections: true
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  comment = NA,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.pos    = "H"
+)
+```
+
+\clearpage
+# Introduction 
+
+Scientific knowledge does not accumulate evenly. A small share of published research shapes entire fields for decades, while most papers receive few citations (Price, 1976). Understanding what drives this difference is important for research funding, technology transfer, and innovation policy. Four main explanations appear in the literature: combining distant ideas (**Fleming**, 2001), position within knowledge networks (Burt, 2004), team composition (Wuchty et al., 2007), and unusual combinations of concepts (Uzzi et al., 2013). This report examines that tension using 10,972 biomedical research records from 1990–1991. LASSO regression, tree-based methods, PCA with clustering, and bias-variance diagnostics are used to analyse citation impact. Two datasets are used throughout: `df_full` (10,972 rows) for descriptive analysis and `df_active` (5,474 rows, all from 1991) for novelty and network models, where structural zeros represent undefined network measures rather than true zero values.
+
+# Setup: Packages and Data Loading
+
+```{r packages}
+library(tidyverse)
+library(corrplot)
+library(glmnet)
+library(gt)   # <-- all tables use gt
+library(e1071)       
+library(patchwork)
+library(rpart)        # decision trees
+library(rpart.plot)   # tree visualisation
+library(randomForest) # random forest
+library(pdp)          # partial dependence plots
+library(caret)        # createDataPartition, createFolds
+library(pdp)
+library(patchwork)
+library(cluster)
+
+```
+
+```{r load-data, class.output = "verbatim"}
+#===============================================================================
+#  Load data
+#===============================================================================
+DATA_PATH <- "pubmed_enhanced_major_B_1990_1991_enhanced_merged_func1_func2_network_features_Assignment2_selected_rows_final.csv"
+
+df_full <- read_csv(DATA_PATH, show_col_types = FALSE)
+
+# Derived target variables 
+df_full <- df_full %>%
+  mutate(
+    LogCited            = log(CitedCount + 1),
+    HighCitation        = as.integer(CitedCount > median(CitedCount, na.rm = TRUE)),
+    HasCommercialImpact = as.integer(CommercialCitations > 0)
+  )
+
+# Fill structural NAs in author-network columns with 0 
+df_full <- df_full %>%
+  mutate(across(c(Degree_Avg, Betweenness_Avg, PageRank_Avg, Core_Number_Avg),
+                ~ replace_na(., 0)))
+
+# Build df_active: rows where novelty/network metrics are defined 
+df_active <- df_full %>% filter(NoveltyScore_v1 > 0)
+
+cat(sprintf("df_full  : %d rows\n", nrow(df_full)))
+cat(sprintf("df_active: %d rows (%.1f%% of full)\n",
+            nrow(df_active), 100 * nrow(df_active) / nrow(df_full)))
+```
+
+```{r diagnose-zeros}
+
+df_full$is_active <- df_full$NoveltyScore_v1 > 0
+
+cat("---Two-track split ----------------\n")
+print(table(df_full$is_active))
+cat(sprintf("\nActive rows   (df_active): %d (%.1f%%)\n",
+            sum(df_full$is_active),
+            mean(df_full$is_active) * 100))
+cat(sprintf("Inactive rows (structural zeros): %d (%.1f%%)\n",
+            sum(!df_full$is_active),
+            (1 - mean(df_full$is_active)) * 100))
+
+#  active vs inactive
+print(table(Year = df_full$Year, Active = df_full$is_active))
+
+# Confirm df_active is built correctly 
+cat("\n---Year breakdown by active status ----------------------\n")
+df_active <- df_full %>% filter(is_active == TRUE)
+cat(sprintf("\ndf_active confirmed: %d rows, years: %s\n",
+            nrow(df_active),
+            paste(sort(unique(df_active$Year)), collapse = ", ")))
+```
+
+***
+
+\clearpage
+# Part 1 : Exploratory Data Analysis
+
+## Q1.0 Dataset Diagnostics (Structural Zero Check)
+
+\FloatBarrier
+
+```{r zero-check, results='asis'}
+# Structural zero rates 
+zero_cols <- c("NoveltyScore_v1","NoveltyScore_v2","NoveltyScore_v3",
+               "BridgingScore_Mean","Consolidation_Mean","Clustering_Mean",
+               "CorePosition_Mean","TopicPairs","CombinationNovelty","BridgingPairs")
+
+zero_rate <- sapply(df_full[zero_cols], function(x) mean(x == 0, na.rm = TRUE))
+
+# BridgingScore_Mean and BridgingPairs are ALL ZERO in this sub-corpus so
+# these columns were dropped before PCA 
+
+data.frame(
+  Column    = names(zero_rate),
+  Zero_Rate = paste0(round(zero_rate * 100, 1), "%"),
+  Note      = c("Structural zero - use df_active",
+                "Identical to v1 (r=1.00)",
+                "Identical to v1 (r=1.00)",
+                "ALL ZERO - drop before PCA/LDA",
+                "Defined for active rows only",
+                "Defined for active rows only",
+                "Defined for active rows only",
+                "Defined for active rows only",
+                "Defined for active rows only",
+                "ALL ZERO - drop before PCA/LDA")
+) |>
+  gt() |>
+  cols_label(
+    Column    = "Variable",
+    Zero_Rate = "Zero Rate",
+    Note      = "Action / Finding"
+  ) |>
+  
+  tab_style(
+    style     = cell_fill(color = "#F8F9FA"),
+    locations = cells_body(rows = c(1, 3, 5, 7, 9))
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#FDECEA"),
+    locations = cells_body(rows = c(4, 10))
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold", color = "#C0392B"),
+    locations = cells_body(rows = c(4, 10))
+  ) |>
+
+  tab_style(
+    style     = list(
+      cell_fill(color = "#2C3E50"),
+      cell_text(weight = "bold", style = "italic", color = "white", size = 11)
+    ),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(columns = Column)
+  ) |>
+  # Zero Rate centred
+  cols_align(align = "center", columns = Zero_Rate) |>
+  cols_width(Column    ~ px(160),Zero_Rate ~ px(90),Note  ~ px(260)
+  ) |>
+  tab_options(
+    table.font.size                = 10,
+    heading.align                  = "left",
+    column_labels.background.color = "#2C3E50",
+    table.border.top.width         = px(3),
+    table.border.top.color         = "#2C3E50",heading.title.font.size = 11,   
+  heading.subtitle.font.size = 9,
+    table.border.bottom.width      = px(3),
+    table.border.bottom.color      = "#2C3E50"
+  )|>
+  tab_header(
+    title    = "Table 1: Summary of zeros in dataset"
+  ) 
+```
+\FloatBarrier
+
+
+The dataset has an important structural feature that affects all subsequent analysis. Around 50% of records have value zero across novelty and network columns. These are not missing values but undefined metrics because of how the pipeline was built. All 1990 records are inactive because novelty needs a prior-year corpus to compare against, and a further 723 single-topic records from 1991 produce no concept pairs. More importantly, Table 1 shows `BridgingScore_Mean` and `BridgingPairs` are zero for every record. Burt (2004) argues structural holes only appear in knowledge networks that are developed enough to have distinct clusters, so their complete absence here suggests early 1990s biomedical literature had not yet reached that point. 
+
+## Summary Statistics Table
+
+\FloatBarrier
+```{r summary-stats, results= 'asis'}
+# Summary statistics table for all key variables 
+summary_stats <- df_full %>%
+  dplyr::select(CitedCount, AuthorCount, TopicCount, DomainCount,
+                NoveltyScore_v1, CombinationNovelty,
+                Consolidation_Mean, Clustering_Mean, 
+                CorePosition_Mean, TopicPairs,
+                Degree_Avg, Core_Number_Avg, 
+                PageRank_Avg, Betweenness_Avg) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") %>%
+  group_by(Variable) %>%
+  summarise(
+    N       = sum(!is.na(Value)),
+    Mean    = round(mean(Value, na.rm = TRUE), 3),
+    SD      = round(sd(Value, na.rm = TRUE), 3),
+    Min     = round(min(Value, na.rm = TRUE), 3),
+    Q1      = round(quantile(Value, 0.25, na.rm = TRUE), 3),
+    Median  = round(median(Value, na.rm = TRUE), 3),
+    Q3      = round(quantile(Value, 0.75, na.rm = TRUE), 3),
+    Max     = round(max(Value, na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  arrange(Variable)
+
+summary_stats |>
+  gt() |>
+  cols_label(
+    Variable = "Variable", N = "N", Mean = "Mean", SD = "SD",
+    Min = "Min", Q1 = "Q1", Median = "Median", 
+    Q3 = "Q3", Max = "Max"
+  ) |>
+  tab_style(
+    style     = list(
+      cell_fill(color = "#2C3E50"),
+      cell_text(weight = "bold", style = "italic", 
+                color = "white", size = 11)
+    ),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#F8F9FA"),
+    locations = cells_body(rows = seq(1, nrow(summary_stats), 2))
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(columns = Variable)
+  ) |>
+  cols_align(align = "center", 
+             columns = c(N, Mean, SD, Min, Q1, Median, Q3, Max)) |>
+  tab_options(
+    table.font.size                = 9,
+    heading.align                  = "left",
+    column_labels.background.color = "#2C3E50",
+    table.border.top.width         = px(3),
+    table.border.top.color         = "#2C3E50",heading.title.font.size = 11,  
+  heading.subtitle.font.size = 9,
+    table.border.bottom.width      = px(3),
+    table.border.bottom.color      = "#2C3E50"
+  )|>
+  tab_header(
+    title    = "Table 2: Statistical Summary"
+  )
+```
+
+\FloatBarrier
+
+## Q1.1.1 Correlation Matrix
+
+```{r corr-matrix, fig.height=9, fig.width=10, fig.cap= "Correlation matrix - all numeric variables (df_full)"}
+# Columns for correlation (drop constants and ID-like cols) 
+corr_cols <- df_full %>%
+  dplyr::select(
+    CitedCount, AuthorCount, TopicCount, DomainCount,
+    NoveltyScore_v1, NoveltyScore_v2, NoveltyScore_v3,  # include all three
+    CombinationNovelty,
+    Consolidation_Mean, Clustering_Mean, CorePosition_Mean, TopicPairs,
+    Degree_Avg, Core_Number_Avg, PageRank_Avg, Betweenness_Avg
+    # BridgingScore_Mean and BridgingPairs still excluded 
+  )
+
+cor_mat <- cor(corr_cols, use = "pairwise.complete.obs")
+
+corrplot(
+  cor_mat,
+  method       = "color",
+  type         = "upper",
+  tl.cex       = 0.82,
+  tl.col       = "black",
+  addCoef.col  = "black",
+  number.cex   = 0.55,
+  diag         = FALSE,
+  col          = colorRampPalette(c("#3B5998","white","#C0392B"))(200),
+  mar          = c(0,0,1,0)
+)
+```
+
+```{r high-corr-table}
+# Extract pairs with Abs(r) > 0.70 
+high_pairs <- which(abs(cor_mat) > 0.70 & abs(cor_mat) < 1.0, arr.ind = TRUE)
+
+high_df <- data.frame(
+  Variable_1 = rownames(cor_mat)[high_pairs[, 1]],
+  Variable_2 = colnames(cor_mat)[high_pairs[, 2]],
+  r          = round(cor_mat[high_pairs], 3)
+) %>%
+  filter(Variable_1 < Variable_2) %>%
+  arrange(desc(abs(r))) %>%
+  mutate(
+    Strength = case_when(abs(r) >= 0.95 ~ "Near-perfect",
+                         abs(r) >= 0.90 ~ "Very strong",
+                         abs(r) >= 0.80 ~ "Strong",
+                         TRUE           ~ "Moderate"),
+    Concern  = case_when(abs(r) >= 0.90 ~ "OLS unstable - LASSO will choose one",
+                         TRUE           ~ "Monitor; LASSO will down-weight")
+  )
+
+high_df |>
+  gt() |>
+  tab_header(
+    title    = "Table 3: Variable pairs with Abs(r) > 0.70"
+  ) |>
+  cols_label(Variable_1 = "Variable 1",Variable_2 = "Variable 2", r = "Pearson r",
+    Strength   = "Strength",Concern    = "Implication"
+  ) |>
+  tab_style(style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style( style     = cell_fill(color = "#FDF3F3"),
+    locations = cells_body(rows = abs(r) >= 0.90)
+  ) |>
+  tab_style(
+    style     = cell_text(color = "#C0392B", weight = "bold"),
+    locations = cells_body(columns = r, rows = abs(r) >= 0.90)
+  ) |>
+  tab_options(table.font.size = 10, heading.align = "left", heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9)
+```
+
+Figure 1 reveals three groups of highly correlated variables. `TopicCount` and `TopicPairs` are almost perfectly correlated (r = 0.97) since more topics simply creates more pairs. `Degree_Avg` and `Core_Number_Avg` are very strongly correlated (r = 0.92) because widely collaborating authors inevitably sit at the network centre. Most importantly, `NoveltyScore_v1`, `v2`, and `v3` are perfectly correlated (r = 1.00) because all active records come from a single year, meaning the time-weighting differences between versions simply do not apply. This makes the novelty comparison in Q1.2.2 largely uninformative, which is a sub-corpus limitation rather than a flaw in the measures. Standard regression would be very unstable under this **multicollinearity**, which is why LASSO is used for dropping redundant variables (James et al., 2021).
+
+  
+### Q1.1.2 Scatter Plots: CitedCount vs Key Predictors
+
+
+
+```{r scatter-plots, fig.height=8, fig.cap= "Scatter plots of log(CitedCount+1) against six key predictors" }
+df_plot <- df_full %>%
+  mutate(LogCited = log(CitedCount + 1))
+
+make_scatter <- function(df, xvar, xlabel, colour = "steelblue") {
+  ggplot(df %>% filter(!is.na(.data[[xvar]])),
+         aes(x = .data[[xvar]], y = LogCited)) +
+    geom_point(alpha = 0.15, size = 0.5, colour = colour) +
+    geom_smooth(method = "loess", se = TRUE, colour = "firebrick",
+                fill = "firebrick", alpha = 0.15, linewidth = 0.9) +
+    labs(x = xlabel, y = "log(CitedCount + 1)") +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(size = 10, face = "bold"))
+}
+
+p1 <- make_scatter(df_plot, "NoveltyScore_v1", "NoveltyScore_v1") +
+  ggtitle("Novelty vs log-citations\n(Theory 2: expect inverted-U?)")
+
+p2 <- make_scatter(df_plot, "CorePosition_Mean", "CorePosition_Mean", "#2ECC71") +
+  ggtitle("Core position vs log-citations\n(Theory 3: core = more visible?)")
+
+p3 <- make_scatter(df_plot, "Degree_Avg", "Degree_Avg (author)", "#9B59B6") +
+  ggtitle("Author degree vs log-citations\n(Theory 4: connected authors win?)")
+
+p4 <- make_scatter(df_plot, "CombinationNovelty", "CombinationNovelty", "#E67E22") +
+  ggtitle("Combination novelty vs log-citations\n(Theory 1: new combos = impact?)")
+
+p5 <- make_scatter(df_plot, "TopicCount", "TopicCount", "#1ABC9C") +
+  ggtitle("Topic breadth vs log-citations\n(more topics = more reach?)")
+
+p6 <- make_scatter(df_plot, "AuthorCount", "AuthorCount", "#E74C3C") +
+  ggtitle("Team size vs log-citations\n(Wuchty 2007: teams outperform?)")
+
+(p1 | p2 | p3) / (p4 | p5 | p6)
+```
+
+Figure 2 reveals a clear hierarchy of predictor relevance that LASSO later confirms. `TopicCount` shows the strongest positive relationship with log-citations, supporting that broader topic coverage attracts readers from multiple communities. `AuthorCount` shows a curved positive relationship, rising for teams of 3 to 8 authors before levelling off, directly supporting **Wuchty et al.** (2007). Critically, `NoveltyScore_v1` shows a largely flat relationship rather than the inverted-U that **Uzzi et al.** (2013) predict, suggesting the optimal distinctiveness effect may not be detectable in a corpus this early.
+  
+### Q1.1.3 Distribution of CitedCount
+
+
+```{r cited-distribution, fig.height=4, fig.cap=" Distribution of CitedCount before and after transformation" }
+g_raw <- ggplot(df_full, aes(CitedCount)) +
+  geom_histogram(bins = 80, fill = "steelblue", colour = "white", linewidth = 0.2) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(title = "Raw CitedCount (df_full)",
+       x = "CitedCount", y = "Count") +
+  theme_minimal(base_size = 11)
+
+g_log <- ggplot(df_full, aes(log(CitedCount + 1))) +
+  geom_histogram(bins = 60, fill = "darkorange", colour = "white", linewidth = 0.2) +
+  labs(title = "log(CitedCount + 1) - log-transformed",
+       x = "log(CitedCount + 1)", y = "Count") +
+  theme_minimal(base_size = 11)
+
+g_raw + g_log
+```
+
+\FloatBarrier
+```{r skewness-table, results='asis'}
+# Skewness + summary stats 
+skew_df <- data.frame(
+  Statistic = c("N", "Mean", "Median", "Max", "% zeros",
+                "Skewness (raw)", "Skewness (log+1)"),
+  Value = c(
+    format(nrow(df_full), big.mark = ","),
+    round(mean(df_full$CitedCount), 2),
+    median(df_full$CitedCount),
+    max(df_full$CitedCount),
+    paste0(round(mean(df_full$CitedCount == 0) * 100, 1), "%"),
+    round(e1071::skewness(df_full$CitedCount), 2),
+    round(e1071::skewness(log(df_full$CitedCount + 1)), 2)
+  )
+)
+
+skew_df |>
+  gt() |>
+  tab_header(
+    title = "Table 4: CitedCount distribution summary"
+  ) |>
+  cols_label(
+    Statistic = "Statistic",
+    Value     = "Value"
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#EAF4FB"),
+    locations = cells_body(rows = c(6, 7))
+  ) |>
+  tab_options(table.font.size = 10, heading.align = "left",heading.title.font.size = 11,  
+  heading.subtitle.font.size = 9)
+```
+\FloatBarrier
+
+  
+```{r distribution-boxplots, fig.height=5, fig.width=12, fig.cap=" Box plots of log(CitedCount+1) against three numerical predictors" }
+# Boxplot by Year 
+p_year <- ggplot(df_full, aes(x = factor(Year), y = log(CitedCount + 1),
+                               fill = factor(Year))) +
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.3, width = 0.5) +
+  scale_fill_manual(values = c("1990" = "steelblue", "1991" = "darkorange")) +
+  labs(title = "By Year",
+       subtitle = "1990 papers had more time to accumulate citations",
+       x = "Year", y = "log(CitedCount + 1)") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+# Boxplot by DomainCount 
+p_domain <- ggplot(df_full, aes(x = factor(DomainCount), y = log(CitedCount + 1),
+                                 fill = factor(DomainCount))) +
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.3) +
+  scale_fill_brewer(palette = "Blues") +
+  labs(title = "By DomainCount",
+       subtitle = "More domains = more interdisciplinary",
+       x = "DomainCount", y = "log(CitedCount + 1)") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+# Boxplot by AuthorCount
+p_author <- ggplot(df_full %>% filter(AuthorCount >= 1),
+                   aes(x = factor(AuthorCount), y = log(CitedCount + 1),
+                       fill = factor(AuthorCount))) +
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.3) +
+  scale_fill_brewer(palette = "RdYlGn") +
+  labs(title = "By AuthorCount",
+       subtitle = "Wuchty et al. (2007): do teams outperform solo authors?",
+       x = "Number of Authors", y = "log(CitedCount + 1)") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+p_year | p_domain | p_author
+```
+
+```{r active-inactive-plot, fig.height=4, fig.width=8}
+# Active vs Inactive citation distribution 
+# Tests whether the structural-zero pattern is itself informative
+ggplot(df_full, aes(x = log(CitedCount + 1), fill = factor(is_active))) +
+  geom_histogram(bins = 50, alpha = 0.6, position = "identity",
+                 colour = "white", linewidth = 0.1) +
+  scale_fill_manual(
+    values = c("FALSE" = "steelblue", "TRUE" = "firebrick"),
+    labels = c("FALSE" = "Inactive - 1990 (structural zero)",
+               "TRUE"  = "Active - 1991 (novelty defined)")
+  ) +
+  labs(title = "Figure 5: Citation distribution: active vs inactive records",
+       subtitle = "Does the structural-zero pattern correlate with citation counts?",
+       x = "log(CitedCount + 1)", y = "Count",
+       fill = "Record status") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+## Q1.2 - LASSO Regression
+
+### Q1.2.1 Baseline LASSO (all predictors, df_active)
+
+```{r lasso-prep, class.output = "verbatim"}
+# Prepare df_active for LASSO 
+df_active <- df_full %>%
+  filter(NoveltyScore_v1 > 0)   # 5,474 rows, all from 1991
+
+cat("df_active rows:", nrow(df_active), "\n")
+cat("Years in df_active:", paste(sort(unique(df_active$Year)), collapse=", "), "\n")
+
+# Response
+y <- df_active$LogCited
+X <- df_active %>%
+  dplyr::select(
+    Year, AuthorCount, TopicCount, DomainCount,
+    NoveltyScore_v1, NoveltyScore_v2, NoveltyScore_v3,
+    CombinationNovelty,
+    Consolidation_Mean, Clustering_Mean, CorePosition_Mean, TopicPairs,
+    Degree_Avg, Core_Number_Avg, PageRank_Avg, Betweenness_Avg
+    # BridgingScore_Mean and BridgingPairs excluded (all zero)
+  ) %>%
+  as.matrix()
+
+cat("Predictor matrix dimensions:", dim(X), "\n")
+cat("Any NA in X:", anyNA(X), "\n")
+```
+
+```{r lasso-cv, fig.height=5, class.output = "verbatim"}
+set.seed(40481810)
+cvfit <- cv.glmnet(X, y,alpha      = 1, nfolds     = 10,standardize = TRUE    
+                   # glmnet standardises internally 
+)
+plot(cvfit)
+title("Figure 6: 10-fold CV MSE vs log(lambda)", line = 2.5)
+
+cat("\nlambda.min (lowest CV-MSE):", round(cvfit$lambda.min, 5))
+cat("\nlambda.1se (most regularised within 1 SE):", round(cvfit$lambda.1se, 5))
+cat("\nMin CV-MSE:", round(min(cvfit$cvm), 4))
+```
+
+### LASSO selected variables 
+
+```{r lasso-coef-table, class.output = "verbatim"}
+#LASSO selected variables 
+coef_min <- coef(cvfit, s = "lambda.min")
+coef_1se <- coef(cvfit, s = "lambda.1se")
+
+coef_df <- data.frame(
+  Variable = rownames(coef_min),
+  Coef_1se = round(as.numeric(coef_1se), 4),
+  Coef_min = round(as.numeric(coef_min), 4)
+) %>%
+  filter(Variable != "(Intercept)") %>%
+  mutate(Selected = ifelse(Coef_1se != 0, "YES", "")) %>%
+  arrange(desc(abs(Coef_1se)))
+
+cat(sprintf("lambda.1se selected %d variables out of %d\n",
+            sum(coef_df$Selected == "YES"), nrow(coef_df)))
+
+coef_df |>
+  gt() |>
+  cols_label(Variable = "Predictor", Coef_1se = "Coef (lambda.1se)",
+             Coef_min = "Coef (lambda.min)", Selected = "Selected?") |>
+  tab_style(
+    style     = list(cell_fill(color = "#2C3E50"),
+                     cell_text(color = "white", weight = "bold")),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(style = cell_fill("#EAFAF1"),
+            locations = cells_body(rows = Selected == "YES")) |>
+  tab_style(style = cell_text(color = "#BDC3C7"),
+            locations = cells_body(rows = Selected == "")) |>
+  tab_options(table.font.size = 10,
+              table.border.top.color = "#2C3E50",
+              table.border.bottom.color = "#2C3E50", heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9)|>
+  tab_header(
+    title    = "Table 5: LASSO selected variables"
+  )
+```
+LASSO with 10-fold cross-validation on `df_active` (n = 5,474) confirms these patterns. `TopicCount` is the single most robust predictor, entering earliest and surviving longest as regularisation increases. `AuthorCount` and `PageRank_Avg` are retained with positive coefficients, confirming team size and author prestige independently drive citations.` PageRank_Avg`'s coefficient of 11,425 reflects near-zero variance in this variable; standardised coefficients confirm the modest effect.`NoveltyScore_v1` is either dropped or carries only a small positive coefficient, adding further doubt to the **Uzzi et al.** (2013) inverted-U hypothesis for this corpus.
+
+```{r lasso-path, fig.height=6, fig.width=14}
+# AI-suggested manual scaling via scale() to fix raw-coefficient scale 
+# distortion in path plot,constant columns removed to prevent NaN errors in glmnet.
+#It was also used to debug here 
+library(ggrepel)
+# Remove constant columns before scaling 
+const_cols <- apply(X, 2, function(col) sd(col, na.rm = TRUE) == 0)
+X_nonconstant <- X[, !const_cols]
+X_scaled <- scale(X_nonconstant)
+
+fit_path <- glmnet(X_scaled, y, alpha = 1, standardize = FALSE)
+
+# Extract coefficients 
+coef_matrix <- as.matrix(coef(fit_path))[-1, ]
+log_lambdas <- log(fit_path$lambda)
+
+path_df <- as.data.frame(t(coef_matrix)) %>%
+  mutate(log_lambda = log_lambdas) %>%
+  pivot_longer(-log_lambda, names_to = "Variable", values_to = "Coefficient")
+label_df <- path_df %>%
+  group_by(Variable) %>%
+  filter(Coefficient != 0) %>%        
+  slice(n() %/% 2) %>%               # take middle point of each line
+  ungroup()
+
+var_names <- unique(path_df$Variable)
+n_vars    <- length(var_names)
+pal       <- colorRampPalette(
+               c("#E74C3C","#E67E22","#F39C12","#2ECC71",
+                 "#3498DB","#9B59B6","#1ABC9C","#E91E63"))(n_vars)
+names(pal) <- var_names
+
+ggplot(path_df, aes(x = log_lambda, y = Coefficient, colour = Variable)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = log(cvfit$lambda.min),
+             linetype = "dashed", colour = "navy", linewidth = 0.9) +
+  geom_vline(xintercept = log(cvfit$lambda.1se),
+             linetype = "dashed", colour = "firebrick", linewidth = 0.9) +
+
+  geom_text_repel(data = label_df,
+                aes(x = log_lambda, y = Coefficient,
+                    label = Variable, colour = Variable), size= 2.5,
+                fontface      = "bold", direction     = "y",nudge_y  = 0.02,   
+                segment.size  = 0.2, segment.alpha = 0.4,segment.linetype = "dotted",
+                box.padding   = 0.2, max.overlaps  = Inf)  +  
+  annotate("text", x = log(cvfit$lambda.min), y = max(path_df$Coefficient) * 0.95,
+           label = "lambda.min", colour = "navy", size = 3, hjust = 1.1) +
+  annotate("text", x = log(cvfit$lambda.1se), y = max(path_df$Coefficient) * 0.95,
+           label = "lambda.1se", colour = "firebrick", size = 3, hjust = -0.1) +
+  scale_colour_manual(values = pal, name = "Variable") +
+  # Expand x axis on the right to make room for labels
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.25))) +
+  labs(title = "Figure 7 : LASSO regularisation path (standardised coefficients)",
+       x     = "log(lambda)",
+       y     = "Standardised coefficient") +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position  = "right",
+    legend.text      = element_text(size = 8),
+    legend.title     = element_text(size = 9, face = "bold"),
+    legend.key.size  = unit(0.5, "cm"),
+    plot.margin      = ggplot2::margin(5, 10, 5, 5)
+  ) +
+  guides(colour = guide_legend(ncol = 1))
+```
+
+### Q1.2.2 Comparing the Three Novelty Measures
+
+\FloatBarrier
+```{r novelty-compare, results='asis'}
+# ── Function: fit LASSO retaining only one novelty measure at a time ------------─
+fit_novelty <- function(df, keep_novelty, seed = 40481810) {
+  drop_others <- setdiff(c("NoveltyScore_v1","NoveltyScore_v2","NoveltyScore_v3"),
+                         keep_novelty)
+  Xn <- df %>%
+    dplyr::select(
+      Year, AuthorCount, TopicCount, DomainCount,
+      all_of(keep_novelty),
+      CombinationNovelty,
+      Consolidation_Mean, Clustering_Mean, CorePosition_Mean, TopicPairs,
+      Degree_Avg, Core_Number_Avg, PageRank_Avg, Betweenness_Avg
+    ) %>%
+    as.matrix()
+  yn <- df$LogCited
+  set.seed(seed)
+  cv.glmnet(Xn, yn, alpha = 1, nfolds = 10, standardize = TRUE)
+}
+
+fit_v1 <- fit_novelty(df_active, "NoveltyScore_v1")
+fit_v2 <- fit_novelty(df_active, "NoveltyScore_v2")
+fit_v3 <- fit_novelty(df_active, "NoveltyScore_v3")
+
+# Summary table 
+novelty_compare <- data.frame(
+  Novelty_Measure = c("NoveltyScore_v1 (raw share, no decay)",
+                      "NoveltyScore_v2 (exponential decay)",
+                      "NoveltyScore_v3 (50% recent decay)"),
+  CV_MSE_min      = round(c(min(fit_v1$cvm), min(fit_v2$cvm), min(fit_v3$cvm)), 5),
+  Lambda_min      = round(c(fit_v1$lambda.min, fit_v2$lambda.min, fit_v3$lambda.min), 5)
+)
+
+novelty_compare |>
+  gt() |>
+  tab_header(
+    title    = "Table 6: LASSO CV-MSE across three novelty measures",
+    subtitle = "df_active - all three are numerically identical in this sub-corpus"
+  ) |>
+  cols_label(
+    Novelty_Measure = "Novelty Measure",
+    CV_MSE_min      = "Min CV-MSE",
+    Lambda_min      = "lambda.min"
+  ) |>
+  tab_style(style     = cell_text(weight = "bold"),locations = cells_column_labels()
+  ) |>
+  tab_style( style     = cell_fill(color = "#EAFAF1"), locations = cells_body(rows = which.min(CV_MSE_min))
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(rows = which.min(CV_MSE_min))
+  ) |>
+  tab_source_note(
+    source_note = "Note: v1/v2/v3 are numerically identical in this sub-corpus (r = 1.00); any CV differences reflect random fold variation only."
+  ) |>
+  tab_options(table.font.size = 10, heading.align = "left", heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9)
+```
+\FloatBarrier
+
+
+### Q1.2.3 LASSO on Subgroups: Interdisciplinary vs Mono-domain
+
+\FloatBarrier
+
+```{r subset-lasso,class.output= "verbatim", results='asis'}
+#===========================================================================
+#Interdisciplinary vs Mono-domain. (LASSO applied)
+#===========================================================================
+df_inter <- df_active %>% filter(DomainCount > 1)
+df_mono  <- df_active %>% filter(DomainCount == 1)
+
+cat(sprintf("Interdisciplinary (DomainCount>1): n=%d (%.0f%% of active)\n",
+            nrow(df_inter), 100 * nrow(df_inter) / nrow(df_active)))
+cat(sprintf("Mono-domain (DomainCount==1):      n=%d (%.0f%% of active)\n",
+            nrow(df_mono),  100 * nrow(df_mono)  / nrow(df_active)))
+
+fit_inter <- fit_novelty(df_inter, "NoveltyScore_v1")
+fit_mono  <- fit_novelty(df_mono,  "NoveltyScore_v1")
+
+# Extract selected variables at lambda.1se 
+get_selected <- function(cvfit) {
+  cf <- coef(cvfit, s = "lambda.1se")
+  nms <- rownames(cf)[which(cf != 0)]
+  nms[nms != "(Intercept)"]
+}
+
+sel_inter <- get_selected(fit_inter)
+sel_mono  <- get_selected(fit_mono)
+
+# Comparison table 
+all_vars <- union(sel_inter, sel_mono)
+
+subgroup_df <- data.frame(
+  Variable         = all_vars,
+  In_Interdiscip   = ifelse(all_vars %in% sel_inter, "YES", ""),
+  In_Mono          = ifelse(all_vars %in% sel_mono,  "YES", "")
+) %>%
+  arrange(desc(In_Interdiscip), Variable)
+
+subgroup_df |>
+  gt() |>
+  tab_header(
+    title    = "Table 7: LASSO variable selection by subgroup",
+    subtitle = "Interdisciplinary vs mono-domain - lambda.1se"
+  ) |>
+  cols_label(
+    Variable       = "Predictor",
+    In_Interdiscip = "Interdisciplinary (DomainCount > 1)",
+    In_Mono        = "Mono-domain (DomainCount = 1)"
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#EAF4FB"),
+    locations = cells_body(rows = In_Interdiscip == "YES" & In_Mono == "")
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#FEF9E7"),
+    locations = cells_body(rows = In_Interdiscip == "" & In_Mono == "YES")
+  ) |>
+  tab_options(table.font.size = 10, heading.align = "left", heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9)
+```
+\FloatBarrier
+
+```{r subgroup-mse-table}
+#===============================================================================
+# LASSO performance summary 
+#===============================================================================
+
+subgroup_mse <- data.frame(
+  Subgroup  = c("Interdisciplinary (DomainCount > 1)",
+                "Mono-domain (DomainCount = 1)"),
+  N         = c(nrow(df_inter), nrow(df_mono)),
+  CV_MSE    = round(c(min(fit_inter$cvm), min(fit_mono$cvm)), 4),
+  Lambda_1se = round(c(fit_inter$lambda.1se, fit_mono$lambda.1se), 5)
+)
+
+subgroup_mse |>
+  gt() |>
+  tab_header(
+    title = "Table 8: LASSO performance by subgroup"
+  ) |>
+  cols_label(
+    Subgroup   = "Subgroup",
+    N          = "n",
+    CV_MSE     = "Min CV-MSE",
+    Lambda_1se = "lambda.1se"
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#EAFAF1"),
+    locations = cells_body(rows = which.min(CV_MSE))
+  ) |>
+  tab_options(table.font.size = 10, heading.align = "left", heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9)
+```
+\FloatBarrier
+
+The subgroup analysis shows citation drivers differ between interdisciplinary and mono-domain records. The higher CV-MSE for interdisciplinary papers suggests that when research crosses domain boundaries, citation impact becomes harder to predict and less systematic. These findings directly guide Part 2, where `TopicCount`, `AuthorCount`, and `CorePosition_Mean` form the **primary** predictor set for tree-based modelling.
+
+
+***
+
+# Part 2 : Option B - Tree-Based Methods
+
+**Justification for choosing  Option B(Tree Based Methods) over Option A (GAM)**
+
+**Tree-based methods** were chosen over **GAM** for three reasons emerging directly from Part 1. Most predictors have very few unique values, making smooth terms unreliable. No individual predictor showed a strong linear relationship with `LogCited`, suggesting citation impact is driven by combinations of variables rather than individual effects, which random forests detect automatically through recursive partitioning (Breiman, 2001). The LASSO also pointed toward a non-linear interaction-driven signal, making trees the natural next step. Decision trees make no distributional assumptions, handling the mixed predictor set naturally. The main caveat is that records sharing authors or topics may have correlated citation patterns, an unavoidable feature of bibliometric data rather than a modelling error.
+
+
+```{r p2-setup, class.output = "verbatim"}
+
+# Fill the 835 NAs in Degree_Avg and Core_Number_Avg with 0
+# (single-author records with no collaboration graph)
+df_active <- df_active %>%
+  mutate(
+    Degree_Avg      = replace_na(Degree_Avg, 0),
+    Core_Number_Avg = replace_na(Core_Number_Avg, 0))
+
+cat("df_active rows:", nrow(df_active), "\n")
+cat("Any NA remaining:", anyNA(df_active %>% 
+    dplyr::select(AuthorCount, TopicCount, DomainCount, NoveltyScore_v1,
+                  CombinationNovelty,Consolidation_Mean, Clustering_Mean,
+                  CorePosition_Mean, TopicPairs,Degree_Avg, Core_Number_Avg)),
+                  "\n")
+
+#---- Define predictor set --------------------------------------------
+# Excluded from models:
+# Year              - constant in df_active (all 1991)
+# NoveltyScore_v2/3 - identical to v1 (r=1.00)
+# BridgingScore_Mean/BridgingPairs - all zero in this corpus
+# PageRank_Avg/Betweenness_Avg    - effectively all zero in df_active
+pred_vars <- c("AuthorCount", "TopicCount", "DomainCount",
+               "NoveltyScore_v1", "CombinationNovelty",
+               "Consolidation_Mean", "Clustering_Mean",
+               "CorePosition_Mean", "TopicPairs",
+               "Degree_Avg", "Core_Number_Avg")
+
+cat("Number of predictors:", length(pred_vars), "\n")
+
+# -------- Model formula -----------------------------------------------------
+model_formula <- as.formula(
+  paste("LogCited ~", paste(pred_vars, collapse = " + "))
+)
+```
+
+
+```{r p2-split, class.output = "verbatim"}
+# ---- 70/30 stratified train/test split--------------------------------------
+# Stratified on HighCitation so both sets have ~50% high/low citation balance
+# This is important because an imbalanced split would give misleading test MSE
+set.seed(40481810)
+train_idx <- caret::createDataPartition(df_active$HighCitation,
+                                        p = 0.70, list = FALSE)
+train <- df_active[ train_idx, ]
+test  <- df_active[-train_idx, ]
+
+cat(sprintf("Data Split Diagnostics \nTrain: %d rows (%.0f%%)\n", nrow(train), 
+            100*nrow(train)/nrow(df_active)))
+cat(sprintf("Test:  %d rows (%.0f%%)\n", nrow(test),  
+            100*nrow(test)/nrow(df_active)))
+cat(sprintf("Train LogCited mean: %.3f\n", mean(train$LogCited)))
+cat(sprintf("Test  LogCited mean: %.3f\n", mean(test$LogCited)))
+cat(sprintf("Train HighCitation rate: %.1f%%\n", 
+            mean(train$HighCitation)*100))
+cat(sprintf("Test  HighCitation rate: %.1f%%\n",  
+            mean(test$HighCitation)*100))
+```
+## Decision Tree
+
+```{r p2-tree, fig.height=7, fig.width=12}
+# Fit decision tree 
+# regression tree (predicting continuous LogCited)
+# cp=0.001 = allow tree to grow fully first 
+set.seed(40481810)
+tree_fit <- rpart(model_formula, data    = train, method  = "anova",
+  control = rpart.control(cp       = 0.001,
+    minsplit = 20,maxdepth = 10
+  )
+)
+
+# Visualise unpruned tree
+rpart.plot(tree_fit,
+           type          = 4,      # show split condition above node
+           extra         = 101,    # show n and % in each node
+           fallen.leaves = TRUE,   # all leaves at bottom
+           main          = "Figure 8 : Decision tree -LogCited (before pruning)",
+           cex           = 0.55,
+           box.palette   = "RdYlGn")
+```
+
+```{r p2-pruning, fig.height=5, fig.width=10, class.output = "verbatim"}
+# Find optimal cp using cross-validation
+# rpart automatically runs internal CV when fitting
+
+par(mar = c(4, 4, 6, 2))
+plotcp(tree_fit, 
+       main = "Figure 9 : CV error vs tree complexity\n(lower = better, pick leftmost point within 1 SE of minimum)")
+# Extract optimal cp 
+cp_table  <- tree_fit$cptable
+best_cp   <- cp_table[which.min(cp_table[, "xerror"]), "CP"]
+cat(sprintf("Optimal cp: %.6f\n", best_cp))
+cat(sprintf("Tree size at optimal cp: %d splits\n",
+            cp_table[which.min(cp_table[,"xerror"]), "nsplit"]))
+
+# Prune tree to optimal size 
+tree_pruned <- prune(tree_fit, cp = best_cp)
+
+# Visualise pruned tree 
+rpart.plot(tree_pruned, type  = 4,extra = 101,fallen.leaves = TRUE,
+           main          = "Figure 10 : Decision tree - LogCited (pruned, optimal cp)",
+           cex           = 0.65,box.palette   = "RdYlGn", ma = 3)
+```
+
+The pruned decision tree (18 splits, optimal cp = 0.002374) confirms the hierarchy from Part 1. The first split is on `TopicCount` at 11, separating the 55% of papers with broader topic coverage (mean `LogCited` = 2.5) from the narrower 45% (mean `LogCited` = 1.7). The second split introduces `Degree_Avg` at 0.5, separating isolated authors from those with at least some collaboration network presence. The third split uses `AuthorCount`, distinguishing solo authors from teams. Together these splits tell a consistent story: topic breadth matters most, followed by author connectivity and then team size, consistent with **Fleming** (2001) and **Wuchty et al.** (2007).
+
+
+```{r p2-tree-performance, class.output = "verbatim"}
+
+# Decision tree test MSE 
+pred_tree <- predict(tree_pruned, newdata = test)
+mse_tree  <- mean((test$LogCited - pred_tree)^2)
+cat(sprintf("Decision tree test MSE: %.4f\n", mse_tree))
+
+#CP table 
+cp_df <- as.data.frame(cp_table) %>%
+  mutate(across(everything(), ~ round(., 4))) %>%
+  head(10)
+
+colnames(cp_df) <- c("CP", "nsplit", "rel_error", "xerror", "xstd")
+
+cp_df |>
+  gt() |>
+  cols_label(
+    CP        = "CP",
+    nsplit    = "Splits",
+    rel_error = "Rel. Error",
+    xerror    = "CV Error",
+    xstd      = "CV Std"
+  ) |>
+  tab_style(
+    style     = list(
+      cell_fill(color = "#2C3E50"),
+      cell_text(weight = "bold", style = "italic",
+                color = "white", size = 11)
+    ),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#EAFAF1"),
+    locations = cells_body(rows = xerror == min(xerror))
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(rows = xerror == min(xerror))
+  ) |>
+  tab_source_note(
+    source_note = "Green = optimal cp. Rel.error = training error relative to root. xerror = CV error."
+  ) |>
+  tab_options(
+    table.font.size                = 10,
+    column_labels.background.color = "#2C3E50",
+    table.border.top.width         = px(3),
+    table.border.top.color         = "#2C3E50",heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9,
+    table.border.bottom.width      = px(3),
+    table.border.bottom.color      = "#2C3E50"
+  )|>
+  tab_header(
+    title = "Table 9: Cp vs Training error "
+  )
+```
+
+
+## Random Forest
+```{r p2-rf-fit, fig.height=4, fig.width=8, class.output = "verbatim"}
+# ── Fit initial random forest 
+# ntree=500: grow 500 trees - standard default, enough for stable OOB error
+# mtry=4: randomly sample 4 predictors at each split
+
+set.seed(40481810)
+m_rf <- randomForest(model_formula, data  = train, ntree      = 500,
+  mtry       = 4, importance = TRUE, do.trace   = FALSE
+)
+
+# Print summary 
+print(m_rf)
+
+# OOB error curve 
+# Shows how OOB MSE changes as more trees are added
+plot(m_rf, main = "Figue 11: Random forest OOB error vs number of trees")
+```
+
+```{r p2-rf-tuning, fig.height=4, fig.width=7, class.output = "verbatim"}
+# Tune mtry: find the number of predictors per split that minimises OOB MSE
+# OOB MSE is a free cross-validation estimate built into random forests
+# Too small = trees are too random (high bias)
+# Too large = trees are too similar (high variance, like bagging)
+
+set.seed(40481810)
+mtry_vals  <- 2:6
+oob_errors <- sapply(mtry_vals, function(m) {
+  rf_m <- randomForest(model_formula, data = train,
+                       ntree = 500, mtry = m,
+                       importance = FALSE)
+  tail(rf_m$mse, 1)   # final OOB MSE after 500 trees
+})
+
+# Plot tuning curve - green point is the best mtrytuning_df <- data.frame(mtry = mtry_vals, OOB_MSE = oob_errors)
+tuning_df <- data.frame(mtry = mtry_vals, OOB_MSE = oob_errors)
+
+ggplot(tuning_df, aes(x = mtry, y = OOB_MSE)) +
+  geom_line(colour = "#2C3E50", linewidth = 1.2) +
+  geom_point(colour = "#E74C3C", size = 3) +
+  geom_point(data = tuning_df %>% filter(OOB_MSE == min(OOB_MSE)),
+             colour = "#1A7A4A", size = 5) +
+  labs(title = "Figure 12: RF tuning: OOB MSE vs mtry",
+       subtitle = "Green point = best mtry",
+       x = "mtry", y = "OOB MSE") +
+  scale_x_continuous(breaks = 2:6) +
+  theme_minimal(base_size = 11)
+
+# Tuning table 
+tuning_df %>%
+  mutate(
+    OOB_MSE = round(OOB_MSE, 4),
+    Note    = ifelse(OOB_MSE == min(OOB_MSE), "Best YES", "")
+  ) |>
+  gt() |>
+  cols_label(mtry = "mtry", OOB_MSE = "OOB MSE", Note = "") |>
+  tab_style(
+    style     = list(
+      cell_fill(color = "#2C3E50"),
+      cell_text(weight = "bold", style = "italic",
+                color = "white", size = 11)
+    ),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#EAFAF1"),
+    locations = cells_body(rows = Note == "Best YES")
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(rows = Note == "Best ")
+  ) |>
+  tab_source_note(
+    source_note = paste0("p = 11 predictors. sqrt(p) = 3.32. p/3 = 3.67. ",
+                         "Best mtry selected for final model.")
+  ) |>
+  tab_options(
+    table.font.size                = 10,
+    column_labels.background.color = "#2C3E50",
+    table.border.top.width         = px(3),
+    table.border.top.color         = "#2C3E50",heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9,
+    table.border.bottom.width      = px(3),
+    table.border.bottom.color      = "#2C3E50"
+  ) |>
+  tab_header( title = " Table 10 : Mtry value with OOB MSE ")
+
+# Refit final model using best mtry found above
+best_mtry <- mtry_vals[which.min(oob_errors)]
+cat(sprintf("Best mtry: %d\n", best_mtry))
+
+set.seed(40481810)
+m_rf <- randomForest(
+  model_formula,
+  data       = train,
+  ntree      = 500,
+  mtry       = best_mtry,
+  importance = TRUE
+)
+cat(sprintf("Final model OOB MSE: %.4f\n", tail(m_rf$mse, 1)))
+```
+
+```{r p2-importance, fig.height=5, fig.width=10}
+#  Variable importance 
+# %IncMSE = importance by accuracy loss; IncNodePurity = importance by split quality
+
+imp_df <- as.data.frame(importance(m_rf)) %>%
+  rownames_to_column("Variable") %>%
+  arrange(desc(`%IncMSE`)) %>%
+  mutate(
+    `%IncMSE`     = round(`%IncMSE`, 3),
+    IncNodePurity = round(IncNodePurity, 1),
+    Rank          = row_number(),
+    Theory        = case_when(
+      Variable == "TopicCount"         ~ "Topic breadth",
+      Variable == "AuthorCount"        ~ "Wuchty 2007: team size",
+      Variable == "NoveltyScore_v1"    ~ "Theory 1/2: novelty",
+      Variable == "CorePosition_Mean"  ~ "Theory 3: knowledge core",
+      Variable == "Consolidation_Mean" ~ "Theory 3: consolidated territory",
+      Variable == "Clustering_Mean"    ~ "Theory 3: local density",
+      Variable == "Degree_Avg"         ~ "Theory 4: author connectivity",
+      Variable == "Core_Number_Avg"    ~ "Theory 4: author core",
+      Variable == "DomainCount"        ~ "Interdisciplinarity",
+      Variable == "TopicPairs"         ~ "Combinatorial complexity",
+      Variable == "CombinationNovelty" ~ "Theory 1: new combinations",
+      TRUE ~ ""
+    )
+  )
+
+# Importance bar chart
+ggplot(imp_df, aes(x = reorder(Variable, `%IncMSE`),
+                   y = `%IncMSE`,
+                   fill = `%IncMSE`)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "#AED6F1", high = "#1A5276") +
+  labs(title    = "Fig 13 : Random forest variable importance",
+       subtitle = "% increase in MSE when variable is randomly permuted - higher = more important",
+       x = "", y = "% Inc MSE") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+# Importance table ( generated using chat gpt )
+imp_df |>
+  gt() |>
+  cols_label(
+    Rank          = "Rank",
+    Variable      = "Variable",
+    `%IncMSE`     = "% Inc MSE",
+    IncNodePurity = "Inc Node Purity",
+    Theory        = "Theory Link"
+  ) |>
+  tab_style(
+    style     = list(
+      cell_fill(color = "#2C3E50"),
+      cell_text(weight = "bold", style = "italic",
+                color = "white", size = 11)
+    ),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#EAFAF1"),
+    locations = cells_body(rows = Rank <= 3)
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#FEF9E7"),
+    locations = cells_body(rows = Rank > 3 & Rank <= 6)
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(columns = Variable)
+  ) |>
+  tab_options(
+    table.font.size                = 10,
+    column_labels.background.color = "#2C3E50",
+    table.border.top.width         = px(3),
+    table.border.top.color         = "#2C3E50",heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9,
+    table.border.bottom.width      = px(3),
+    table.border.bottom.color      = "#2C3E50"
+  ) |> 
+  tab_header( title = " Table 11 : Variable Importance Table")
+```
+Random forest variable importance produces a more nuanced picture. The tuned model (mtry = 2, ntree = 500) achieved an OOB MSE of 1.8094. `CombinationNovelty` ranks first (%IncMSE = 27.85), followed by `Clustering_Mean` (26.77) and `Degree_Avg` (26.12), contrasting with LASSO and tree results where `TopicCount` dominated. Random forest importance measures each variable's marginal contribution, so once topic breadth is controlled for, novelty and network density add meaningful independent signal. This supports Fleming (2001) more strongly than LASSO suggested, as new concept combinations matter but their effect is masked when variables compete directly. While basic characteristics dominate the early tree splits, network variables collectively match them in random forest importance, suggesting both matter but at different stages of the citation process. This partially supports Burt (2004), though the absence of bridging variables limits how fully structural holes theory can be tested.
+
+## Model Comparison and Partial Dependence
+
+```{r p2-pdp, fig.height=6, fig.width=14}
+#Preparing partial differential plots 
+p_core <- pdp::partial(m_rf, pred.var = "CorePosition_Mean",
+                       train = train, plot = TRUE,
+                       plot.engine = "ggplot2") +
+  ggtitle(" Fig 14 - PDP: CorePosition_Mean") + theme_minimal()
+
+p_consol <- pdp::partial(m_rf, pred.var = "Consolidation_Mean",
+                         train = train, plot = TRUE,
+                         plot.engine = "ggplot2") +
+  ggtitle("PDP: Consolidation_Mean") + theme_minimal()
+
+p_clust <- pdp::partial(m_rf, pred.var = "Clustering_Mean",
+                        train = train, plot = TRUE,
+                        plot.engine = "ggplot2") +
+  ggtitle("PDP: Clustering_Mean") + theme_minimal()
+
+p_nov <- pdp::partial(m_rf, pred.var = "NoveltyScore_v1",
+                      train = train, plot = TRUE,
+                      plot.engine = "ggplot2") +
+  ggtitle("PDP: NoveltyScore_v1") + theme_minimal()
+
+p_auth <- pdp::partial(m_rf, pred.var = "AuthorCount",
+                       train = train, plot = TRUE,
+                       plot.engine = "ggplot2") +
+  ggtitle("PDP: AuthorCount") + theme_minimal()
+
+p_topic <- pdp::partial(m_rf, pred.var = "TopicCount",
+                        train = train, plot = TRUE,
+                        plot.engine = "ggplot2") +
+  ggtitle("PDP: TopicCount") + theme_minimal()
+
+p_core | p_consol | p_clust | p_nov | p_auth | p_topic
+```
+The partial dependence plots add shape information that importance rankings alone cannot provide (Friedman, 2001). `TopicCount` rises strongly up to around 20 topics before levelling off, showing diminishing returns to breadth. `AuthorCount` peaks around 5 to 7 authors before flattening, directly replicating **Wuchty et al.** (2007). `NoveltyScore_v1` shows a weak positive relationship up to 0.75 before dropping, which is the closest evidence in this corpus to the **Uzzi et al.** (2013) inverted-U, though the effect is modest and concentrated at very high novelty rather than forming a clear peak at moderate novelty. `Consolidation_Mean` and `Clustering_Mean` both decline at higher values, suggesting papers sitting in very dense and well established knowledge territories face more competition for citations.
+
+```{r p2-cv-comparison, class.output = "verbatim"}
+# 10-fold CV comparing decision tree vs random forest
+# We need mse_tree and mse_rf computed from the same CV folds
+# so the comparison is fair
+# AI assisted in structuring the CV loop and gt table formatting.
+set.seed(40481810)
+folds    <- caret::createFolds(train$LogCited, k = 10)
+mse_tree_cv <- numeric(10)
+mse_rf_cv   <- numeric(10)
+
+for (i in seq_along(folds)) {
+  tr_i  <- train[-folds[[i]], ]
+  val_i <- train[ folds[[i]], ]
+
+  # Decision tree
+  tree_i <- rpart(model_formula, data = tr_i,
+                  method = "anova",
+                  control = rpart.control(cp = best_cp,
+                                          minsplit = 20))
+  pred_tree_i     <- predict(tree_i, newdata = val_i)
+  mse_tree_cv[i]  <- mean((val_i$LogCited - pred_tree_i)^2)
+
+  # Random forest
+  rf_i <- randomForest(model_formula, data = tr_i,
+                       ntree = 500, mtry = best_mtry,
+                       importance = FALSE)
+  pred_rf_i     <- predict(rf_i, newdata = val_i)
+  mse_rf_cv[i]  <- mean((val_i$LogCited - pred_rf_i)^2)
+}
+
+cat(sprintf("Tree CV-MSE: %.4f (SD: %.4f)\n",
+            mean(mse_tree_cv), sd(mse_tree_cv)))
+cat(sprintf("RF   CV-MSE: %.4f (SD: %.4f)\n",
+            mean(mse_rf_cv),   sd(mse_rf_cv)))
+
+# Final test set performance
+pred_tree_test <- predict(tree_pruned, newdata = test)
+pred_rf_test   <- predict(m_rf,        newdata = test)
+mse_tree_test  <- mean((test$LogCited - pred_tree_test)^2)
+mse_rf_test    <- mean((test$LogCited - pred_rf_test)^2)
+
+# Comparison table
+comparison_df <- data.frame(
+  Model      = c("Decision Tree (pruned)",
+                 "Random Forest (tuned)",
+                 "LASSO (Part 1 reference)"),
+  CV_MSE     = round(c(mean(mse_tree_cv),
+                        mean(mse_rf_cv),
+                        min(cvfit$cvm)), 4),
+  Test_MSE   = round(c(mse_tree_test,
+                        mse_rf_test,
+                        NA), 4),
+  Note       = c(
+    "Single tree - interpretable, high variance",
+    "Ensemble of 500 trees - lower variance",
+    "Linear model - from 10-fold CV in Part 1"
+  )
+)
+
+comparison_df |>
+  gt() |>
+  cols_label(
+    Model    = "Model",
+    CV_MSE   = "10-fold CV-MSE",
+    Test_MSE = "Test MSE (30%)",
+    Note     = "Note"
+  ) |>
+  tab_style(
+    style     = list(
+      cell_fill(color = "#2C3E50"),
+      cell_text(weight = "bold", style = "italic",
+                color = "white", size = 11)
+    ),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#EAFAF1"),
+    locations = cells_body(rows = CV_MSE == min(CV_MSE, na.rm = TRUE))
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(columns = Model)
+  ) |>
+  tab_options(
+    table.font.size                = 10,
+    column_labels.background.color = "#2C3E50",
+    table.border.top.width         = px(3),
+    table.border.top.color         = "#2C3E50",heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9,
+    table.border.bottom.width      = px(3),
+    table.border.bottom.color      = "#2C3E50"
+  ) |> 
+  tab_header ( title = " Table 12 : 10-fold CV Comparison")
+```
+
+The random forest **outperforms** the pruned tree in both cross-validation (CV-MSE: 1.8076 vs 1.8384) and on the test set (1.9122 vs 1.9446), confirming that ensembling reduces variance inherent in single trees (Breiman, 2001). Both models perform comparably to LASSO (CV-MSE: 1.8057), suggesting non-linear effects are real but do not dramatically improve predictive accuracy over a well-regularised linear model. For practitioners, supporting teams working across multiple topic areas remains more reliably associated with citation impact than targeting novelty or network position alone.
+
+***
+\clearpage
+# Part 3 : Model Selection and Classification 
+
+## Justification for Option A
+
+**Option A** was chosen because Parts 1 and 2 identified several correlated network variables that are individually overlapping but collectively important. PCA reduces this redundancy into interpretable dimensions without discarding variables. Clustering answers whether papers with similar network profiles share citation outcomes, without requiring a predefined binary target.
+
+
+```{r dataset preparation, class.output = "verbatim"}
+net_vars <- df_active %>%
+  dplyr::select(Consolidation_Mean, Clustering_Mean,
+                CorePosition_Mean, Degree_Avg, Core_Number_Avg)
+
+# ======Drop constant columns before PCA===================================
+# This is the defensive check against sd=0 
+const_mask <- sapply(net_vars, function(x) sd(x, na.rm = TRUE) == 0)
+if (any(const_mask)) {
+  cat("Dropping constant columns:",
+      paste(names(net_vars)[const_mask], collapse = ", "), "\n")
+  net_vars <- net_vars[, !const_mask]
+} else {
+  cat("No constant columns found - all 5 variables kept for PCA\n")
+}
+```
+
+## Principal Component Analysis 
+
+```{r p3-pca, class.output = "verbatim"}
+#===========================================================================
+# Principal Component Analysis 
+#===========================================================================
+pca <- prcomp(net_vars, center = TRUE , scale. = TRUE ) # center and sd so that variables with high values do not dominate 
+
+prop_var <- pca$sdev^2 / sum(pca$sdev^2) #dividing variance gives te proportion explained 
+cum_var <- cumsum(prop_var) #cumulative variance 
+npc_80 <- which(cum_var >= 0.80)[1] #how many pc can explain about 80% of the variance 
+
+for (i in 1:5) {
+  cat(sprintf("PC%d: %.1f%% (cumulative: %.1f%%)\n",
+              i, prop_var[i]*100, cum_var[i]*100))
+}
+cat(sprintf("\nPCs needed for 80%%: %d\n", npc_80))
+```
+
+```{r p3-scree, fig.height=4, fig.width=10}
+#=============================================================================
+#screeplot and cumulative plot 
+#=============================================================================
+scree_df <- data.frame( PC = paste0("PC", 1:5),#dataframe with each pc as a row
+                         Variance = prop_var*100,
+                         Cumulative = cum_var*100)
+
+pscree <- ggplot( scree_df, aes(x= PC, y = Variance, group = 1)) + #variance per pc
+  geom_col(fill = "#3498DB", alpha = 0.7, width = 0.6) +
+  geom_line(colour = "#2C3E50", linewidth = 1.2) +
+  geom_point(colour = "#2C3E50", size = 3) +
+  labs(title    = "Fig 15 : Scree plot",
+       subtitle = "Variance explained by each PC",
+       x = "Principal Component",
+       y = "% Variance Explained") +
+  theme_minimal(base_size = 11)
+
+p_cum <- ggplot(scree_df, aes(x= PC, y = Cumulative, group = 1))+ #pc vs cum
+  geom_line(colour = "#E74C3C", linewidth = 1.2) +
+  geom_point(colour = "#E74C3C", size = 3) +
+  geom_hline(yintercept = 80, linetype = "dashed",
+             colour = "navy", linewidth = 0.8) +
+  annotate("text", x = 1.2, y = 83,
+           label = "80% threshold", colour = "navy", size = 3) +
+  labs(title    = "Fig 16: Cumulative variance explained",
+       subtitle = paste0(npc_80, " PCs needed for 80%"),
+       x = "Principal Component",
+       y = "Cumulative %") +
+  theme_minimal(base_size = 11)
+
+pscree | p_cum
+
+```
+
+PC1 and PC2 ( Fig : 16 ) together capture 80.0% of total variance across the five network variables, with three components technically needed. BridgingScore_Mean and BridgingPairs were excluded as established in Part 1. The high concentration of variance in just two components suggests the network variables are not measuring five independent dimensions but rather two underlying structural axes.
+\FloatBarrier
+
+```{r p3 loadings,results='asis'}
+#=============================================================================
+#PC Loadings table 
+#=============================================================================
+# Loadings show how much each original variable contributes to each PC
+loadings_df <- as.data.frame(round(pca$rotation[, 1:3], 3)) %>%
+  rownames_to_column("Variable") # pc1 to 3 
+loadings_df |>
+  gt() |>
+  cols_label(Variable = "Variable") |>
+  tab_style(
+    style     = list(
+      cell_fill(color = "#2C3E50"),
+      cell_text(color = "white", weight = "bold")
+    ),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#EAFAF1"),
+    locations = cells_body(rows = PC1 > 0.35, columns = "PC1")
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#FDECEA"),
+    locations = cells_body(rows = PC1 < -0.35, columns = "PC1")
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(columns = Variable)
+  ) |>
+  #see if needs to be removed !!
+  tab_source_note("Green = strong positive on PC1. Red = strong negative.") |>
+  tab_options(
+    table.font.size      = 10,
+    table.border.top.color    = "#2C3E50",
+    table.border.bottom.color = "#2C3E50",heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9
+  )|>
+  tab_header( title = " Table 13 : Loadings table (PCA)")
+```
+
+\FloatBarrier
+
+```{r p3-biplot, fig.height=6, fig.width=8}
+
+# Biplot
+biplot(pca,
+       scale = 0,
+       cex   = 0.5,
+       col   = c("#BDC3C7", "#E74C3C"),
+       main  = "Fig 17: PCA Biplot - knowledge network variables (df_active)")
+
+
+```
+
+The loadings table reveals what these two axes represent. PC1 loads positively on all five variables, meaning it captures overall **network embeddedness**. Papers scoring high here have concepts that are densely connected, centrally positioned, and well consolidated simultaneously. This can be labelled "knowledge integration." PC2 is more interesting as it pulls knowledge density variables (`Clustering_Mean`, `Consolidation_Mean`) in one direction and author centrality variables (`Degree_Avg`, `Core_Number_Avg`) in the opposite direction. This suggests a genuine tension in the data between papers whose concepts sit in dense knowledge territory but whose authors are relatively isolated, and papers with widely connected authors working in less consolidated areas. The biplot confirms this contrast visually. This finding adds nuance to Theory 4 since author centrality and knowledge network density are not simply aligned but can pull in opposing directions.
+
+
+```{r p3-pc-scores, fig.height=8, fig.width=8}
+# PC scores coloured by citation level 
+# Key question: do high-citation papers cluster in a specific region of PC space?
+# If yes = network structure predicts citation impact
+# If no = report honestly
+
+quart <- factor(dplyr::ntile(df_active$CitedCount, 4),
+                levels = 1:4,
+                labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)"))
+
+scores_df <- as.data.frame(pca$x[, 1:2]) %>%
+  mutate(
+    Quartile     = quart,
+    HighCitation = factor(df_active$HighCitation,
+                          labels = c("Low", "High"))) 
+    # attach the citation quartile to PC1 AND PC2 scores 
+#PLOT1: coloured by citation quartile 
+p_quart <- ggplot(scores_df,aes( x= PC1, y = PC2, colour = Quartile))+
+  geom_point(alpha = 0.4, size = 0.8) +
+  stat_ellipse(level = 0.68, linewidth = 0.8) +
+  scale_colour_brewer(palette = "RdYlBu", direction = -1) +
+  labs(title    = "Fig 18 : PC1 vs PC2 - citation quartile",
+       subtitle = "Do high-citation papers cluster in a specific region?",
+       x = "PC1", y = "PC2", colour = "Quartile") +
+  theme_minimal(base_size = 11)
+
+ # Plot 2: coloured by HighCitation binary
+p_high <- ggplot(scores_df, aes(x = PC1, y = PC2, colour = HighCitation)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  stat_ellipse(level = 0.68, linewidth = 0.8) +
+  scale_colour_manual(values = c("Low" = "steelblue", "High" = "#E74C3C")) +
+  labs(title    = "Fig 19 : PC1 vs PC2 - HighCitation",
+       subtitle = "Above vs below median citations",
+       x = "PC1", y = "PC2", colour = "Citation") +
+  theme_minimal(base_size = 11)
+
+p_quart / p_high 
+```
+
+Despite capturing 80% of network variance, high and low citation papers overlap substantially across PC space and Q4 papers do not cluster in a distinct region. Knowledge network structure is therefore not a strong standalone predictor of citation impact, consistent with Part 2 where network variables provided secondary signal once topic breadth and team size were accounted for.
+
+## Clustering 
+
+```{r p3-elbow-sil, fig.height=4, fig.width=10, class.output = "verbatim"}
+#=============================================================================
+# ELBOW METHOD AND SILHOUTTE SCORE 
+#=============================================================================
+#  Clustering input, first PCs scaled 
+X_clust <- scale(pca$x[, 1:npc_80])
+ks      <- 2:8
+
+# ── Elbow: WSS for each k ─────────────────────────────────────────────────
+set.seed(40481810)
+wss <- sapply(ks, function(k) kmeans(X_clust, centers = k, nstart = 25)$tot.withinss)
+
+p_elbow <- ggplot(data.frame(k = ks, WSS = wss), aes(x = k, y = WSS)) +
+  geom_line(colour = "#2C3E50", linewidth = 1.2) +
+  geom_point(colour = "#E74C3C", size = 3) +
+  scale_x_continuous(breaks = ks) +
+  labs(title = "Fig 20 : Elbow method", x = "k", y = "Within-cluster SS") +
+  theme_minimal(base_size = 11)
+
+# Silhouette: sample 5000 rows 
+set.seed(40481810)
+sample_idx <- if (nrow(X_clust) > 5000) sample(nrow(X_clust), 5000) else seq_len(nrow(X_clust))
+Xs  <- X_clust[sample_idx, , drop = FALSE]
+dXs <- dist(Xs)
+
+sil_vals <- sapply(ks, function(k) {
+  mean(silhouette(kmeans(Xs, centers = k, nstart = 25)$cluster, dXs)[, 3])
+})
+
+best_k <- ks[which.max(sil_vals)]
+cat(sprintf("Best k by silhouette: %d\n", best_k))
+
+p_sil <- ggplot(data.frame(k = ks, Sil = sil_vals), aes(x = k, y = Sil)) +
+  geom_line(colour = "#2C3E50", linewidth = 1.2) +
+  geom_point(colour = "#1A7A4A", size = 3) +
+  geom_point(data = data.frame(k = best_k, Sil = max(sil_vals)),
+             colour = "#E74C3C", size = 5) +
+  scale_x_continuous(breaks = ks) +
+  labs(title = "Fig 21 : Silhouette method", subtitle = "Red = best k",
+       x = "k", y = "Avg silhouette width") +
+  theme_minimal(base_size = 11)
+
+p_elbow | p_sil
+```
+
+```{r p3-kmeans, fig.height=5, fig.width=10, class.output = "verbatim"}
+#Fit final k-means with best k 
+# we try 25 random starting points and keep the best
+set.seed(40481810)
+km_final <- kmeans(X_clust, centers = best_k, nstart = 25)
+
+cat("Cluster sizes:\n")
+print(table(km_final$cluster))
+
+# Add cluster labels to scores dF
+scores_df <- scores_df %>%
+  mutate(Cluster = factor(km_final$cluster))
+
+# Plot clusters in PC space
+ggplot(scores_df, aes(x = PC1, y = PC2, colour = Cluster)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  stat_ellipse(level = 0.68, linewidth = 1.0) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(title    = "Figure 22 : K-means clusters in PC space",
+       subtitle = paste0("k = ", best_k,
+                         " - do clusters align with citation levels?"),
+       x = "PC1", y = "PC2", colour = "Cluster") +
+  theme_minimal(base_size = 11)
+```
+
+```{r p3-cluster-table}
+# AI assisted in forming a clear informative table 
+cluster_summary <- df_active %>%
+  mutate(Cluster = factor(km_final$cluster)) %>%
+  group_by(Cluster) %>%
+  summarise(
+    N                  = n(),
+    Pct_High           = round(mean(HighCitation) * 100, 1),
+    Median_Citations   = median(CitedCount),
+    Mean_CorePosition  = round(mean(CorePosition_Mean), 1),
+    Mean_Consolidation = round(mean(Consolidation_Mean), 1),
+    Mean_Clustering    = round(mean(Clustering_Mean), 3),
+    Mean_Degree        = round(mean(Degree_Avg), 2),
+    Mean_Novelty       = round(mean(NoveltyScore_v1), 3),
+    .groups = "drop"
+  )
+
+cluster_summary |>
+  gt() |>
+  tab_style(
+    style     = list(cell_fill(color = "#2C3E50"),
+                     cell_text(color = "white", weight = "bold")),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#EAFAF1"),
+    locations = cells_body(rows = Pct_High == max(Pct_High))
+  ) |>
+  tab_options(table.font.size = 7,
+              table.border.top.color    = "#2C3E50",
+              table.border.bottom.color = "#2C3E50", heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9) |> 
+  tab_header( title = " Table 14 : Cluster Table")
+```
+
+```{r cluster-anova, class.output = "verbatim"}
+cluster_anova <- aov(CitedCount ~ factor(km_final$cluster), 
+                     data = df_active)
+summary(cluster_anova)
+```
+
+The cluster summary table shows k = 4 produces meaningful differences despite weak overall separation confirmed by the **Silhouette method**. The four clusters are: Cluster 1 ("peripheral low-novelty", Burt 2004, low bridging capacity), Cluster 2 ("consolidated isolated", Uzzi 2013, too established to stand out), Cluster 3 ("high-novelty connected", Fleming 2001, new ideas with strong author networks), and Cluster 4 ("core embedded mid-novelty", Fleming 2001, moderate novelty in established territory). Cluster 3 has the highest citation rate, combining peak novelty and author connectivity, neither alone is enough. Cluster 2 has the lowest impact despite highest consolidation, reinforcing the Part 2 finding that dense knowledge territories attract fewer citations. Impact requires both novelty and connectivity together.
+
+***
+
+# Part 4 : Bias-Variance Trade-off and Temporal Analysis 
+
+## Q 4.1 Bias-variance Tradeoff
+
+```{r p4-bv, fig.height=5, fig.width=10}
+#=============================================================================
+# Q4.1 Bias-Variance Tradeoff  
+#=============================================================================
+
+## Vary ntree from 1 to 500 - complexity dial for bias-variance plot
+ntree_vals <- c(1, 5, 10, 25, 50, 100, 200, 500)
+set.seed(40481810)
+# Fitted one forest per ntree value, record training and OOB error
+results <- sapply(ntree_vals, function(nt) {
+  rf  <- randomForest(model_formula, data = train,
+                      ntree = nt, mtry = best_mtry)
+  c(train = mean((train$LogCited - predict(rf, train))^2),
+    oob   = tail(rf$mse, 1)) #Test error is not used here as OOB error already serves 
+#as an unbiased validation measure. Each tree is tested 
+#on samples it never saw during training, removing the 
+#need for a separate held-out set.
+})
+
+bv_df <- data.frame(
+  ntree = rep(ntree_vals, 2),
+  MSE   = c(results["train",], results["oob",]),
+  Type  = rep(c("Training MSE","OOB MSE (CV)"), each = 8)
+)
+
+ggplot(bv_df, aes(x = ntree, y = MSE, colour = Type)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = c("Training MSE" = "#E74C3C",
+                                  "OOB MSE (CV)" = "#2C3E50")) +
+  scale_x_continuous(breaks = ntree_vals) +
+  labs(title    = "Figure 23: Bias-variance trade-off - Random Forest",
+       subtitle = "Training MSE always falls. OOB MSE plateaus at the sweet spot.\nNOTE : At ntree = 1, Variance dominates (training MSE = 1.45, 
+OOB = 2.90), bagging narrows this to 1.28 by ntree = 100,\n where remaining error reflects fixed Bias plus irreducible citation variance, post-publication factors \nno single-year snapshot can predict.",
+       x = "Number of trees", y = "MSE", colour = "") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+\FloatBarrier
+```{r p4-bv-table,results='asis'}
+data.frame(
+  ntree     = ntree_vals,
+  Train_MSE = round(results["train",], 4),
+  OOB_MSE   = round(results["oob",], 4),
+  Gap       = round(results["oob",] - results["train",], 4),
+  Regime    = c("High variance","High variance","Improving","Improving",
+                "Sweet spot","Sweet spot","Plateau","Plateau")
+) |>
+  gt() |>
+  tab_style(
+    style     = list(cell_fill(color = "#2C3E50"),
+                     cell_text(color = "white", weight = "bold")),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(style = cell_fill("#FDECEA"),
+            locations = cells_body(rows = Regime == "High variance")) |>
+  tab_style(style = cell_fill("#EAFAF1"),
+            locations = cells_body(rows = Regime == "Sweet spot")) |>
+  tab_source_note("Red = high variance. Green = sweet spot. Gap = overfitting signal.") |>
+  tab_options(table.font.size = 10,
+              table.border.top.color = "#2C3E50",
+              table.border.bottom.color = "#2C3E50", heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9) |>
+  tab_header( title = " Table 15 : Bias-Variance Tradeoff")
+```
+\FloatBarrier
+
+Figure 23 shows OOB MSE stabilising beyond ntree = 100, marking the sweet spot. Training MSE keeps falling but the gap with OOB MSE stops widening after ntree = 25, confirming the model has stabilised. The high variance region is ntree = 1 to 10 where a single tree is unstable. Unlike single trees, random forests do not overfit as complexity increases because each tree is trained on a random data subset (Breiman, 2001).
+
+## Polynomial Analysis - Topic Count
+
+```{r p4-poly, fig.height=5, fig.width=8, class.output = "verbatim"}
+
+#============================================================================
+# Q4.2 POLYNOMIAL / TEMPORAL ANALYSIS
+#============================================================================
+cat("Unique years:", length(unique(df_active$Year)),
+    "- poly(Year,2) not applicable\n")# Year has only 1 unique value in df_active -poly(Year,2) not applicable
+cat("TopicCount unique values:", length(unique(df_active$TopicCount)), "\n")
+
+# Fit linear, quadratic, cubic - nested models compared via ANOVA and AIC
+m_lin  <- lm(LogCited ~ TopicCount,          data = df_active)
+m_quad <- lm(LogCited ~ poly(TopicCount, 2), data = df_active)
+m_cub  <- lm(LogCited ~ poly(TopicCount, 3), data = df_active)
+
+anova(m_lin, m_quad, m_cub)
+```
+
+```{r p4-poly-table}
+data.frame(
+  Model  = c("Linear","Quadratic","Cubic"),
+  R2     = round(c(summary(m_lin)$r.squared,
+                   summary(m_quad)$r.squared,
+                   summary(m_cub)$r.squared), 4),
+  Adj_R2 = round(c(summary(m_lin)$adj.r.squared,
+                   summary(m_quad)$adj.r.squared,
+                   summary(m_cub)$adj.r.squared), 4),
+  AIC    = round(c(AIC(m_lin), AIC(m_quad), AIC(m_cub)), 2)
+) |>
+  gt() |>
+  tab_style(
+    style     = list(cell_fill(color = "#2C3E50"),
+                     cell_text(color = "white", weight = "bold")),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(style = cell_fill("#EAFAF1"),
+            locations = cells_body(rows = AIC == min(AIC))) |>
+  tab_source_note("Green = best model by AIC. Lower AIC = better.") |>
+  tab_header( title = " Table 16 : Linear and Polynomial Model comparison") |>
+  tab_options(table.font.size = 10,
+              table.border.top.color = "#2C3E50",
+              table.border.bottom.color = "#2C3E50",heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9)
+```
+
+```{r p4-poly-plot, fig.height=5, fig.width=8}
+grid <- data.frame(TopicCount = seq(2, 34, length.out = 100))
+grid$Linear    <- predict(m_lin,  grid)
+grid$Quadratic <- predict(m_quad, grid)
+grid$Cubic     <- predict(m_cub,  grid)
+
+grid %>%
+  pivot_longer(-TopicCount, names_to = "Model", values_to = "Predicted") %>%
+  ggplot(aes(x = TopicCount, y = Predicted, colour = Model)) +
+  geom_point(data    = df_active,
+             aes(x = TopicCount, y = LogCited),  # x added here
+             alpha   = 0.1, size = 0.5,
+             colour  = "grey60",
+             inherit.aes = FALSE) +
+  geom_line(linewidth = 1.2) +
+  scale_colour_manual(values = c("Linear"    = "#3498DB",
+                                  "Quadratic" = "#E74C3C",
+                                  "Cubic"     = "#2ECC71")) +
+  labs(title    = "Fig 24 : Polynomial effects of TopicCount on LogCited",
+       subtitle = "Note: the cubic line's sharp decline at high TopicCount is an extrapolation artifact, only too few papers \nexist at that range for the polynomial to fit reliably, producing the same inflated flexibility the \nbias-variance trade-off warns against at high model complexity.",
+       x = "TopicCount", y = "Predicted LogCited", colour = "Model") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+```
+
+`Year` has only one unique value in df_active so `TopicCount` was used instead. Figure 24 and the ANOVA table confirm that both quadratic and cubic terms significantly improve on a linear fit, reducing AIC from 19,258 to 19,188, though the absolute R-squared remains low at 0.103. Regarding Year, older records accumulate more citations simply because they have had more time, not because they are inherently better (Merton, 1968). The cleanest correction would be using a citation rate as the response variable, which would also affect interpretation of network variables across the two years.The quadratic shape shows diminishing returns, broader topics attract more readers but beyond 20 topics, marginal citation gains fall, suggesting ultra-broad records lose focus.
+
+## Multimethod Analysis- Stacked Ensemble
+\FloatBarrier
+```{r p4 stacking, class.output = "verbatim", results='asis'}
+
+#============================================================================
+# Q4.3 STACKED ENSEMBLE
+#============================================================================
+
+#setting up 5 fold CV for generating OOF predictions 
+#Using Out-oF-fOLD to prevent meta learner from seeing the same data twice 
+
+set.seed(40481810)
+folds <- caret::createFolds(train$LogCited, k= 5)
+oof_lasso <- oof_rf <- oof_lm <- numeric(nrow(train))
+
+#  Generated OOF predictions from each base learner 
+for (i in seq_along(folds)) {
+  tri  <- train[-folds[[i]], ]   # 4 folds for training
+  vali <- train[ folds[[i]], ]   # 1 fold for predicting
+  idx   <- folds[[i]]             # row indices of the held-out fold
+
+  # LASSO prediction on held-out fold
+  lassoi        <- cv.glmnet(as.matrix(tri[, pred_vars]),
+                               tri$LogCited, alpha = 1, nfolds = 5)
+  oof_lasso[idx] <- predict(lassoi, as.matrix(vali[, pred_vars]),
+                             s = "lambda.min")[, 1]
+
+  # Random forest prediction on held-out fold
+  oof_rf[idx] <- predict(
+    randomForest(model_formula, data = tri, ntree = 200, mtry = best_mtry),
+    vali)
+
+  # Linear model prediction on held-out fold
+  oof_lm[idx] <- predict(lm(model_formula, data = tri), vali)
+}
+#Asking for the best blend given these three predictions 
+meta_model <- lm(y ~ lasso + rf + lm,
+                  data = data.frame(lasso = oof_lasso,
+                                    rf    = oof_rf,
+                                    lm    = oof_lm,
+                                    y     = train$LogCited))
+cat("Meta-learner weights:\n")
+print(round(coef(meta_model), 4))
+
+# Generated test predictions from each base learner 
+# Now fit each model on ALL training data and predict on test set
+t_lasso <- predict(
+  cv.glmnet(as.matrix(train[, pred_vars]), train$LogCited, alpha = 1),
+  as.matrix(test[, pred_vars]), s = "lambda.min")[, 1]
+
+t_rf  <- predict(m_rf, test)
+
+t_lm  <- predict(lm(model_formula, train), test)
+
+# Blend test predictions using meta-learner weights
+t_stack <- predict(meta_model,
+                    data.frame(lasso = t_lasso, rf = t_rf, lm = t_lm))
+
+data.frame(
+  Model    = c("LASSO","Linear Model","Random Forest","Stacked Ensemble"),
+  Test_MSE = round(c(mean((test$LogCited - t_lasso)^2),
+                      mean((test$LogCited - t_lm)^2),
+                      mean((test$LogCited - t_rf)^2),
+                      mean((test$LogCited - t_stack)^2)), 4)
+) |>
+  gt() |>
+  tab_style(
+    style     = list(cell_fill(color = "#2C3E50"),
+                     cell_text(color = "white", weight = "bold")),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(style = cell_fill("#EAFAF1"),
+            locations = cells_body(rows = Test_MSE == min(Test_MSE))) |>
+  tab_style(style = cell_text(weight = "bold"),
+            locations = cells_body(columns = Model)) |>
+  tab_header( title = " Table 17 : Test MSE for all models and stacked model") |>
+  tab_options(table.font.size = 10,
+              table.border.top.color    = "#2C3E50",
+              table.border.bottom.color = "#2C3E50", heading.title.font.size = 11,    
+  heading.subtitle.font.size = 9)|> tab_footnote(
+    footnote = "Meta-learner weights (RF = 0.47, LM = 0.46, LASSO = 0.08) indicate simultaneous non-linear and linear citation signal. LASSO's near-zero weight confirms regularisation dropped features that RF recovered.",
+    locations = cells_column_labels(columns = Model)
+  )
+```
+\FloatBarrier
+
+```{r p4 time-cv, class.output = "verbatim"}
+#============================================================================
+# Time aware CV 
+#============================================================================
+
+cat("Unique years in df_active:", 
+    paste(sort(unique(df_active$Year)), collapse = ", "), "\n")
+cat("Expanding-window CV requires at least 3 distinct years - not applicable.\n")
+```
+```{r stacking-diagram, fig.height=4, fig.width=9}
+
+library(ggplot2)
+
+boxes <- data.frame(
+  x     = c(2, 5, 8, 5, 5),
+  y     = c(4, 4, 4, 2.5, 1),
+  label = c("Base Learner 1\n(LASSO)",
+            "Base Learner 2\n(Random Forest)",
+            "Base Learner 3\n(Linear Model)",
+            "Meta-Learner\n(OOF predictions as input)",
+            "Final Prediction\n(held-out test set)"),
+  fill  = c("#AED6F1","#A9DFBF","#F9E79F","#D7BDE2","#F1948A")
+)
+
+arrows <- data.frame(
+  x    = c(2, 5, 8, 5),
+  xend = c(5, 5, 5, 5),
+  y    = c(3.6, 3.6, 3.6, 2.1),
+  yend = c(2.9, 2.9, 2.9, 1.4)
+)
+
+ggplot() +
+  geom_segment(data = arrows,
+               aes(x=x, xend=xend, y=y, yend=yend),
+               arrow = arrow(length = unit(0.25,"cm")),
+               colour = "grey40", linewidth = 0.6) +
+  geom_tile(data = boxes,
+            aes(x=x, y=y, fill=fill),
+            width = 2.6, height = 0.55,
+            colour = "grey60", linewidth = 0.4) +
+  labs(title= " Figure 25 : Stacking Procedure Diagram")+
+  scale_fill_identity() +
+  geom_text(data = boxes,
+            aes(x=x, y=y, label=label),
+            size = 3, lineheight = 0.9) +
+  annotate("text", x=1, y=3.25,
+           label="OOF\npredictions", size=2.5,
+           colour="grey40", fontface="italic") +
+  annotate("text", x=9, y=3.25,
+           label="OOF\npredictions", size=2.5,
+           colour="grey40", fontface="italic") +
+  theme_void() +
+  theme(legend.position = "none")
+```
+
+
+The stacking results table shows the ensemble achieves the lowest test MSE at 1.8677, beating all individual models. The meta-learner weights show random forest and linear model contributing almost equally while LASSO adds very little. In an ideal setup, cross-validation would follow the time order of the data, training on older records and testing on newer ones (James et al., 2021). This is not possible here since all active records come from one year. In a dataset covering multiple years this approach would give a more honest picture of how well the model would work on new, unseen papers.
+
+*** 
+
+# Conclusion
+
+This analysis investigated what drives citation impact in early biomedical literature across four parts. Topic breadth and team size were the most consistent predictors throughout, supporting Fleming (2001) and Wuchty et al. (2007). Network variables added a secondary signal, and the clustering analysis showed that the highest impact papers combined novelty with author connectivity rather than relying on either alone. The Uzzi et al. (2013) prediction that moderately novel work attracts the most citations was not supported, possibly because the 1990-91 corpus is too early for this pattern to emerge. Key dataset limitations included a single active year preventing time-aware cross-validation and missing bridging variables limiting the test of Burt (2004). The stacked ensemble confirmed that combining models improves accuracy over any single approach. For practitioners, the clearest takeaway is that supporting teams working across multiple topic areas remains the most reliable way to increase research impact.
+
+***
+
+# Code Explanation
+
+## Data Preprocessing
+
+The raw dataset was loaded using `readr::read_csv`. Three derived target variables were created: `LogCited` as log(CitedCount + 1) to address severe right skew, `HighCitation` as a binary indicator for records above the median, and `HasCommercialImpact` for records with any commercial citations. Structural NA values in the four author network columns were filled with zero using `tidyr::replace_na`, as these represent single-author records with no collaboration graph. A two-track convention was adopted: df_full retaining all 10,972 rows for descriptive analysis, and df_active filtering to 5,474 rows where NoveltyScore_v1 > 0. The predictor set excluded Year (constant in df_active), NoveltyScore_v2/v3 (identical to v1), BridgingScore_Mean and BridgingPairs (all zero), and PageRank_Avg/Betweenness_Avg (near-zero throughout). All NA values were confirmed absent before modelling using `anyNA()`.
+
+## Key Functions and Libraries
+
+Part 1 used `corrplot::corrplot` for the correlation heatmap and `glmnet::cv.glmnet` for LASSO with 10-fold cross-validation, with predictors standardised internally by glmnet. Coefficient paths used `base::scale` to prevent distortion, with `ggrepel::geom_text_repel` for readable labels. Two helper functions were written: `fit_novelty` to fit LASSO retaining one novelty measure at a time, and `get_selected` to extract non-zero variables at lambda.1se.
+
+Part 2 used `rpart::rpart` with `method = "anova"` for regression trees, pruned using the optimal cp from `rpart$cptable`. The train/test split used `caret::createDataPartition` stratified on `HighCitation` to preserve class balance. Random forests were fitted using `randomForest::randomForest` with mtry tuned across values 2 to 6 by OOB MSE. Variable importance was extracted using `randomForest::importance` and partial dependence plots generated using `pdp::partial`. The 10-fold CV comparison used `caret::createFolds` to ensure identical fold assignments across models.
+
+Part 3 used `base::prcomp` with `center = TRUE` and `scale. = TRUE` — scaling ensures variables with larger raw values like Consolidation_Mean do not dominate the components. Constant columns were checked before PCA using `base::sd`. Citation quartiles were created using `dplyr::ntile` to avoid the breaks-not-unique error. K-means used `base::kmeans` with `nstart = 25` random initialisations to avoid local minima. Silhouette width was computed using `cluster::silhouette` on a sample of 5,000 rows.
+
+Part 4 fitted forests across eight ntree values using OOB MSE as the validation error. Polynomial models were compared using `stats::lm` with `poly()`, evaluated via `stats::anova` and `stats::AIC`. In the stacked ensemble, out-of-fold predictions were generated using `idx <- folds[[i]]`, ensuring each row was predicted by a model that never trained on it — preventing the leakage that would occur if base learner predictions were made on their own training data.
+
+## Validation and Debugging
+
+Outputs were checked using `dim()`, `anyNA()`, and `cat()` statements. OOB MSE was compared against test MSE to confirm no overfitting. Constant columns were detected programmatically before PCA.
+
+## Hyperparameter Choices
+
+Lambda.1se was preferred over lambda.min for parsimony. Optimal cp was selected by minimising cross-validated relative error. mtry = 2 was chosen by lowest OOB MSE. ntree = 500 was used as OOB MSE had stabilised. The cubic polynomial was selected by lowest AIC.
+
+## Reproducibility and GenAI Use
+
+Seeds were set consistently using a fixed seed across all random operations including LASSO, train/test splitting, random forest fitting, k-means, and stacking. GenAI was used to assist with debugging error messages, structuring the stacking loop, and formatting gt tables. All variable selections, model choices, hyperparameter decisions, and written interpretations are my own.
+
+****
+# References
+
+- Breiman, L. (2001) 'Random forests', *Machine Learning*, 45(1), pp. 5-32.
+
+- Burt, R.S. (2004) 'Structural holes and good ideas', *American Journal of Sociology*, 110(2), pp. 349-399.
+
+- Fleming, L. (2001) 'Recombinant uncertainty in technological search', *Management Science*, 47(1), pp. 117-132.
+
+- Friedman, J.H. (2001) 'Greedy function approximation: a gradient boosting machine', *Annals of Statistics*, 29(5), pp. 1189-1232.
+
+- James, G., Witten, D., Hastie, T. and Tibshirani, R. (2021) *An Introduction to Statistical Learning with Applications in R*. 2nd edn. New York: Springer.
+
+- Merton, R.K. (1968) 'The Matthew effect in science', *Science*, 159(3810), pp. 56-63.
+
+- Price, D.J. de S. (1976) 'A general theory of bibliometric and other cumulative advantage processes', *Journal of the American Society for Information Science*, 27(5), pp. 292-306.
+
+- Uzzi, B., Mukherjee, S., Stringer, M. and Jones, B. (2013) 'Atypical combinations and scientific impact', *Science*, 342(6157), pp. 468-472.
+
+- Wuchty, S., Jones, B.F. and Uzzi, B. (2007) 'The increasing dominance of teams in production of knowledge', *Science*, 316(5827), pp. 1036-1039.
